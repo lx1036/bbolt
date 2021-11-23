@@ -44,21 +44,45 @@ type meta struct {
 
 // Ensure that a database can be opened without error.
 func TestOpen(t *testing.T) {
-	path := tempfile()
-	defer os.RemoveAll(path)
-
+	path := "./tmp/db"
+	//defer os.RemoveAll(path)
+	
 	db, err := bolt.Open(path, 0666, nil)
 	if err != nil {
 		t.Fatal(err)
 	} else if db == nil {
 		t.Fatal("expected db")
 	}
-
-	if s := db.Path(); s != path {
-		t.Fatalf("unexpected path: %s", s)
+	defer db.Close()
+	
+	if err := db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucket([]byte("widgets"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put([]byte("foo"), []byte("bar")); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put([]byte("baz"), []byte("bat")); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Delete([]byte("foo")); err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := db.Close(); err != nil {
+	if err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("widgets"))
+		if v := b.Get([]byte("foo")); v != nil {
+			t.Fatalf("expected nil value, got: %v", v)
+		}
+		if v := b.Get([]byte("baz")); !bytes.Equal(v, []byte("bat")) {
+			t.Fatalf("unexpected value: %v", v)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -53,6 +53,70 @@ const (
 	FreelistMapType = FreelistType("hashmap")
 )
 
+// Options represents the options that can be set when opening a database.
+type Options struct {
+	// Timeout is the amount of time to wait to obtain a file lock.
+	// When set to zero it will wait indefinitely. This option is only
+	// available on Darwin and Linux.
+	Timeout time.Duration
+
+	// Sets the DB.NoGrowSync flag before memory mapping the file.
+	NoGrowSync bool
+
+	// Do not sync freelist to disk. This improves the database write performance
+	// under normal operation, but requires a full database re-sync during recovery.
+	NoFreelistSync bool
+
+	// FreelistType sets the backend freelist type. There are two options. Array which is simple but endures
+	// dramatic performance degradation if database is large and framentation in freelist is common.
+	// The alternative one is using hashmap, it is faster in almost all circumstances
+	// but it doesn't guarantee that it offers the smallest page id available. In normal case it is safe.
+	// The default type is array
+	FreelistType FreelistType
+
+	// Open database in read-only mode. Uses flock(..., LOCK_SH |LOCK_NB) to
+	// grab a shared lock (UNIX).
+	ReadOnly bool
+
+	// Sets the DB.MmapFlags flag before memory mapping the file.
+	MmapFlags int
+
+	// InitialMmapSize is the initial mmap size of the database
+	// in bytes. Read transactions won't block write transaction
+	// if the InitialMmapSize is large enough to hold database mmap
+	// size. (See DB.Begin for more information)
+	//
+	// If <=0, the initial map size is 0.
+	// If initialMmapSize is smaller than the previous database size,
+	// it takes no effect.
+	InitialMmapSize int
+
+	// PageSize overrides the default OS page size.
+	PageSize int
+
+	// NoSync sets the initial value of DB.NoSync. Normally this can just be
+	// set directly on the DB itself when returned from Open(), but this option
+	// is useful in APIs which expose Options but not the underlying DB.
+	NoSync bool
+
+	// OpenFile is used to open files. It defaults to os.OpenFile. This option
+	// is useful for writing hermetic tests.
+	OpenFile func(string, int, os.FileMode) (*os.File, error)
+
+	// Mlock locks database file in memory when set to true.
+	// It prevents potential page faults, however
+	// used memory can't be reclaimed. (UNIX only)
+	Mlock bool
+}
+
+// DefaultOptions represent the options used if nil options are passed into Open().
+// No timeout is used which will cause Bolt to wait indefinitely for a lock.
+var DefaultOptions = &Options{
+	Timeout:      0,
+	NoGrowSync:   false,
+	FreelistType: FreelistArrayType,
+}
+
 // DB represents a collection of buckets persisted to a file on disk.
 // All data access is performed through transactions which can be obtained through the DB.
 // All the functions on DB will return a ErrDatabaseNotOpen if accessed before Open() is called.
@@ -127,7 +191,6 @@ type DB struct {
 	Mlock bool
 
 	path     string
-	openFile func(string, int, os.FileMode) (*os.File, error)
 	file     *os.File
 	dataref  []byte // mmap'ed readonly, write throws SEGV
 	data     *[maxMapSize]byte
@@ -163,21 +226,6 @@ type DB struct {
 	readOnly bool
 }
 
-// Path returns the path to currently open database file.
-func (db *DB) Path() string {
-	return db.path
-}
-
-// GoString returns the Go string representation of the database.
-func (db *DB) GoString() string {
-	return fmt.Sprintf("bolt.DB{path:%q}", db.path)
-}
-
-// String returns the string representation of the database.
-func (db *DB) String() string {
-	return fmt.Sprintf("DB<%q>", db.path)
-}
-
 // Open creates and opens a database at the given path.
 // If the file does not exist then it will be created automatically.
 // Passing in nil options will cause Bolt to open the database with the default options.
@@ -207,26 +255,15 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		db.readOnly = true
 	}
 
-	db.openFile = options.OpenFile
-	if db.openFile == nil {
-		db.openFile = os.OpenFile
-	}
-
 	// Open data file and separate sync handler for metadata writes.
 	var err error
-	if db.file, err = db.openFile(path, flag|os.O_CREATE, mode); err != nil {
+	if db.file, err = os.OpenFile(path, flag|os.O_CREATE, mode); err != nil {
 		_ = db.close()
 		return nil, err
 	}
 	db.path = db.file.Name()
 
-	// Lock file so that other processes using Bolt in read-write mode cannot
-	// use the database  at the same time. This would cause corruption since
-	// the two processes would write meta pages and free pages separately.
-	// The database file is locked exclusively (only one process can grab the lock)
-	// if !options.ReadOnly.
-	// The database file is locked using the shared lock (more than one process may
-	// hold a lock at the same time) otherwise (options.ReadOnly is set).
+	// INFO: 文件锁，如果是写事务，则互斥锁；如果是读事务，则共享锁
 	if err := flock(db, !db.readOnly, options.Timeout); err != nil {
 		_ = db.close()
 		return nil, err
@@ -237,7 +274,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	if db.pageSize = options.PageSize; db.pageSize == 0 {
 		// Set the default page size to the OS page size.
-		db.pageSize = defaultPageSize
+		db.pageSize = defaultPageSize // 4 KB
 	}
 
 	// Initialize the database if it doesn't exist.
@@ -309,6 +346,21 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	return db, nil
 }
 
+// Path returns the path to currently open database file.
+func (db *DB) Path() string {
+	return db.path
+}
+
+// GoString returns the Go string representation of the database.
+func (db *DB) GoString() string {
+	return fmt.Sprintf("bolt.DB{path:%q}", db.path)
+}
+
+// String returns the string representation of the database.
+func (db *DB) String() string {
+	return fmt.Sprintf("DB<%q>", db.path)
+}
+
 // loadFreelist reads the freelist if it is synced, or reconstructs it
 // by scanning the DB if it is not synced. It assumes there are no
 // concurrent accesses being made to the freelist.
@@ -372,7 +424,7 @@ func (db *DB) mmap(minsz int) error {
 	}
 
 	// Memory-map the data file as a byte slice.
-	if err := mmap(db, size); err != nil {
+	if err := mmap(db, size); err != nil { //INFO: mmap 从磁盘到内存中
 		return err
 	}
 
@@ -469,9 +521,12 @@ func (db *DB) mrelock(fileSizeFrom, fileSizeTo int) error {
 }
 
 // init creates a new database file and initializes its meta pages.
+// INFO: 最开始两个 page 是 meta page, pageid={0,1}
+//  pageid=2 第三页是 freelist page
+//  pageid=3 第四页是 free leaf page
 func (db *DB) init() error {
 	// Create two meta pages on a buffer.
-	buf := make([]byte, db.pageSize*4)
+	buf := make([]byte, db.pageSize*4) // 4个page
 	for i := 0; i < 2; i++ {
 		p := db.pageInBuffer(buf, pgid(i))
 		p.id = pgid(i)
@@ -501,7 +556,7 @@ func (db *DB) init() error {
 	p.flags = leafPageFlag
 	p.count = 0
 
-	// Write the buffer to our data file.
+	// INFO: 写buffer到db.file里并落盘
 	if _, err := db.ops.writeAt(buf, 0); err != nil {
 		return err
 	}
@@ -1066,70 +1121,6 @@ func (db *DB) freepages() []pgid {
 		}
 	}
 	return fids
-}
-
-// Options represents the options that can be set when opening a database.
-type Options struct {
-	// Timeout is the amount of time to wait to obtain a file lock.
-	// When set to zero it will wait indefinitely. This option is only
-	// available on Darwin and Linux.
-	Timeout time.Duration
-
-	// Sets the DB.NoGrowSync flag before memory mapping the file.
-	NoGrowSync bool
-
-	// Do not sync freelist to disk. This improves the database write performance
-	// under normal operation, but requires a full database re-sync during recovery.
-	NoFreelistSync bool
-
-	// FreelistType sets the backend freelist type. There are two options. Array which is simple but endures
-	// dramatic performance degradation if database is large and framentation in freelist is common.
-	// The alternative one is using hashmap, it is faster in almost all circumstances
-	// but it doesn't guarantee that it offers the smallest page id available. In normal case it is safe.
-	// The default type is array
-	FreelistType FreelistType
-
-	// Open database in read-only mode. Uses flock(..., LOCK_SH |LOCK_NB) to
-	// grab a shared lock (UNIX).
-	ReadOnly bool
-
-	// Sets the DB.MmapFlags flag before memory mapping the file.
-	MmapFlags int
-
-	// InitialMmapSize is the initial mmap size of the database
-	// in bytes. Read transactions won't block write transaction
-	// if the InitialMmapSize is large enough to hold database mmap
-	// size. (See DB.Begin for more information)
-	//
-	// If <=0, the initial map size is 0.
-	// If initialMmapSize is smaller than the previous database size,
-	// it takes no effect.
-	InitialMmapSize int
-
-	// PageSize overrides the default OS page size.
-	PageSize int
-
-	// NoSync sets the initial value of DB.NoSync. Normally this can just be
-	// set directly on the DB itself when returned from Open(), but this option
-	// is useful in APIs which expose Options but not the underlying DB.
-	NoSync bool
-
-	// OpenFile is used to open files. It defaults to os.OpenFile. This option
-	// is useful for writing hermetic tests.
-	OpenFile func(string, int, os.FileMode) (*os.File, error)
-
-	// Mlock locks database file in memory when set to true.
-	// It prevents potential page faults, however
-	// used memory can't be reclaimed. (UNIX only)
-	Mlock bool
-}
-
-// DefaultOptions represent the options used if nil options are passed into Open().
-// No timeout is used which will cause Bolt to wait indefinitely for a lock.
-var DefaultOptions = &Options{
-	Timeout:      0,
-	NoGrowSync:   false,
-	FreelistType: FreelistArrayType,
 }
 
 // Stats represents statistics about the database.

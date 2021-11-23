@@ -412,7 +412,7 @@ func (n *node) rebalance() {
 	n.bucket.tx.stats.Rebalance++
 
 	// Ignore if node is above threshold (25%) and has enough keys.
-	var threshold = n.bucket.tx.db.pageSize / 4
+	var threshold = n.bucket.tx.db.pageSize / 4 // 1024
 	if n.size() > threshold && len(n.inodes) > n.minKeys() {
 		return
 	}
