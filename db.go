@@ -13,6 +13,12 @@ import (
 	"unsafe"
 )
 
+// maxMapSize represents the largest mmap size supported by Bolt.
+const maxMapSize = 0xFFFFFFFFFFFF // 256TB
+
+// maxAllocSize is the size used when creating array pointers.
+const maxAllocSize = 0x7FFFFFFF
+
 // The largest step that can be taken when remapping the mmap.
 const maxMmapStep = 1 << 30 // 1GB
 
@@ -200,8 +206,8 @@ type DB struct {
 	meta1    *meta
 	pageSize int
 	opened   bool
-	rwtx     *Tx
-	txs      []*Tx
+	rwtx     *Tx   // INFO: 只有一个写事务
+	txs      []*Tx // INFO: 读事务可以多个
 	stats    Stats
 
 	freelist     *freelist
@@ -344,6 +350,227 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// Mark the database as opened and return.
 	return db, nil
+}
+
+// INFO: 初始化两个 meta page, freelist page, empty leaf page
+//  最开始两个 page 是 meta page, pageid={0,1}
+//  pageid=2 第三页是 freelist page
+//  pageid=3 第四页是 free leaf page
+func (db *DB) init() error {
+	// Create two meta pages on a buffer.
+	buf := make([]byte, db.pageSize*4) // 4个page
+	for i := 0; i < 2; i++ {
+		p := db.pageInBuffer(buf, pgid(i))
+		p.id = pgid(i)
+		p.flags = metaPageFlag
+
+		// Initialize the meta page.
+		m := p.meta()
+		m.magic = magic
+		m.version = version
+		m.pageSize = uint32(db.pageSize)
+		m.freelist = 2
+		m.root = bucket{root: 3} // INFO: 创建 meta 会自动创建一个 root bucket, 后续创建的 bucket 都是其 subbucket
+		m.pgid = 4
+		m.txid = txid(i)
+		m.checksum = m.sum64()
+	}
+
+	// Write an empty freelist at page 3.
+	p := db.pageInBuffer(buf, pgid(2))
+	p.id = pgid(2)
+	p.flags = freelistPageFlag
+	p.count = 0
+
+	// Write an empty leaf page at page 4.
+	p = db.pageInBuffer(buf, pgid(3))
+	p.id = pgid(3)
+	p.flags = leafPageFlag
+	p.count = 0
+
+	// INFO: 写buffer到db.file里并落盘
+	if _, err := db.ops.writeAt(buf, 0); err != nil {
+		return err
+	}
+	if err := db.file.Sync(); err != nil { // 刷盘
+		return err
+	}
+	db.filesz = len(buf)
+
+	return nil
+}
+
+// Update INFO: read-write tx, one-writer and many-readers 一写多读
+func (db *DB) Update(fn func(*Tx) error) error {
+	t, err := db.Begin(true)
+	if err != nil {
+		return err
+	}
+
+	// Make sure the transaction rolls back in the event of a panic.
+	defer func() {
+		if t.db != nil {
+			t.rollback()
+		}
+	}()
+
+	// Mark as a managed tx so that the inner function cannot manually commit.
+	t.managed = true
+
+	// If an error is returned from the function then rollback and return error.
+	err = fn(t)
+	t.managed = false
+	if err != nil {
+		_ = t.Rollback()
+		return err
+	}
+
+	return t.Commit()
+}
+
+func (db *DB) View(fn func(*Tx) error) error {
+	t, err := db.Begin(false)
+	if err != nil {
+		return err
+	}
+
+	// Make sure the transaction rolls back in the event of a panic.
+	defer func() {
+		if t.db != nil {
+			t.rollback()
+		}
+	}()
+
+	// Mark as a managed tx so that the inner function cannot manually rollback.
+	t.managed = true
+
+	// If an error is returned from the function then pass it through.
+	err = fn(t)
+	t.managed = false
+	if err != nil {
+		_ = t.Rollback()
+		return err
+	}
+
+	return t.Rollback()
+}
+
+// Batch calls fn as part of a batch. It behaves similar to Update,
+// except:
+//
+// 1. concurrent Batch calls can be combined into a single Bolt
+// transaction.
+//
+// 2. the function passed to Batch may be called multiple times,
+// regardless of whether it returns error or not.
+//
+// This means that Batch function side effects must be idempotent and
+// take permanent effect only after a successful return is seen in
+// caller.
+//
+// The maximum batch size and delay can be adjusted with DB.MaxBatchSize
+// and DB.MaxBatchDelay, respectively.
+//
+// Batch is only useful when there are multiple goroutines calling it.
+func (db *DB) Batch(fn func(*Tx) error) error {
+	errCh := make(chan error, 1)
+
+	db.batchMu.Lock()
+	if (db.batch == nil) || (db.batch != nil && len(db.batch.calls) >= db.MaxBatchSize) {
+		// There is no existing batch, or the existing batch is full; start a new one.
+		db.batch = &batch{
+			db: db,
+		}
+		db.batch.timer = time.AfterFunc(db.MaxBatchDelay, db.batch.trigger)
+	}
+	db.batch.calls = append(db.batch.calls, call{fn: fn, err: errCh})
+	if len(db.batch.calls) >= db.MaxBatchSize {
+		// wake up batch, it's ready to run
+		go db.batch.trigger()
+	}
+	db.batchMu.Unlock()
+
+	err := <-errCh
+	if err == trySolo {
+		err = db.Update(fn)
+	}
+	return err
+}
+
+// Begin INFO: one-writer and many-readers 一写多读, 不能在一个 goroutine 里开启读事务和写事务
+func (db *DB) Begin(writable bool) (*Tx, error) {
+	if writable {
+		return db.beginRWTx()
+	}
+	return db.beginTx()
+}
+
+func (db *DB) beginTx() (*Tx, error) {
+	// Lock the meta pages while we initialize the transaction. We obtain
+	// the meta lock before the mmap lock because that's the order that the
+	// write transaction will obtain them.
+	db.metalock.Lock()
+
+	// Obtain a read-only lock on the mmap. When the mmap is remapped it will
+	// obtain a write lock so all transactions must finish before it can be
+	// remapped.
+	// mmap 是读锁
+	db.mmaplock.RLock()
+
+	// Exit if the database is not open yet.
+	if !db.opened {
+		db.mmaplock.RUnlock()
+		db.metalock.Unlock()
+		return nil, ErrDatabaseNotOpen
+	}
+
+	// Create a transaction associated with the database.
+	t := &Tx{}
+	t.init(db)
+
+	// Keep track of transaction until it closes.
+	db.txs = append(db.txs, t) // INFO: 读事务可以多个
+	n := len(db.txs)
+
+	// Unlock the meta pages.
+	db.metalock.Unlock()
+
+	// Update the transaction stats.
+	db.statlock.Lock()
+	db.stats.TxN++
+	db.stats.OpenTxN = n
+	db.statlock.Unlock()
+
+	return t, nil
+}
+
+func (db *DB) beginRWTx() (*Tx, error) {
+	// If the database was opened with Options.ReadOnly, return an error.
+	if db.readOnly {
+		return nil, ErrDatabaseReadOnly
+	}
+
+	// Obtain writer lock. This is released by the transaction when it closes.
+	// This enforces only one writer transaction at a time.
+	db.rwlock.Lock()
+
+	// Once we have the writer lock then we can lock the meta pages so that
+	// we can set up the transaction.
+	db.metalock.Lock()
+	defer db.metalock.Unlock()
+
+	// Exit if the database is not open yet.
+	if !db.opened {
+		db.rwlock.Unlock()
+		return nil, ErrDatabaseNotOpen
+	}
+
+	// Create a transaction associated with the database.
+	t := &Tx{writable: true}
+	t.init(db)
+	db.rwtx = t // INFO: 只有一个写事务
+	db.freePages()
+	return t, nil
 }
 
 // Path returns the path to currently open database file.
@@ -520,54 +747,6 @@ func (db *DB) mrelock(fileSizeFrom, fileSizeTo int) error {
 	return nil
 }
 
-// init creates a new database file and initializes its meta pages.
-// INFO: 最开始两个 page 是 meta page, pageid={0,1}
-//  pageid=2 第三页是 freelist page
-//  pageid=3 第四页是 free leaf page
-func (db *DB) init() error {
-	// Create two meta pages on a buffer.
-	buf := make([]byte, db.pageSize*4) // 4个page
-	for i := 0; i < 2; i++ {
-		p := db.pageInBuffer(buf, pgid(i))
-		p.id = pgid(i)
-		p.flags = metaPageFlag
-
-		// Initialize the meta page.
-		m := p.meta()
-		m.magic = magic
-		m.version = version
-		m.pageSize = uint32(db.pageSize)
-		m.freelist = 2
-		m.root = bucket{root: 3}
-		m.pgid = 4
-		m.txid = txid(i)
-		m.checksum = m.sum64()
-	}
-
-	// Write an empty freelist at page 3.
-	p := db.pageInBuffer(buf, pgid(2))
-	p.id = pgid(2)
-	p.flags = freelistPageFlag
-	p.count = 0
-
-	// Write an empty leaf page at page 4.
-	p = db.pageInBuffer(buf, pgid(3))
-	p.id = pgid(3)
-	p.flags = leafPageFlag
-	p.count = 0
-
-	// INFO: 写buffer到db.file里并落盘
-	if _, err := db.ops.writeAt(buf, 0); err != nil {
-		return err
-	}
-	if err := fdatasync(db); err != nil {
-		return err
-	}
-	db.filesz = len(buf)
-
-	return nil
-}
-
 // Close releases all database resources.
 // It will block waiting for any open transactions to finish
 // before closing the database and returning.
@@ -620,97 +799,6 @@ func (db *DB) close() error {
 
 	db.path = ""
 	return nil
-}
-
-// Begin starts a new transaction.
-// Multiple read-only transactions can be used concurrently but only one
-// write transaction can be used at a time. Starting multiple write transactions
-// will cause the calls to block and be serialized until the current write
-// transaction finishes.
-//
-// Transactions should not be dependent on one another. Opening a read
-// transaction and a write transaction in the same goroutine can cause the
-// writer to deadlock because the database periodically needs to re-mmap itself
-// as it grows and it cannot do that while a read transaction is open.
-//
-// If a long running read transaction (for example, a snapshot transaction) is
-// needed, you might want to set DB.InitialMmapSize to a large enough value
-// to avoid potential blocking of write transaction.
-//
-// IMPORTANT: You must close read-only transactions after you are finished or
-// else the database will not reclaim old pages.
-func (db *DB) Begin(writable bool) (*Tx, error) {
-	if writable {
-		return db.beginRWTx()
-	}
-	return db.beginTx()
-}
-
-func (db *DB) beginTx() (*Tx, error) {
-	// Lock the meta pages while we initialize the transaction. We obtain
-	// the meta lock before the mmap lock because that's the order that the
-	// write transaction will obtain them.
-	db.metalock.Lock()
-
-	// Obtain a read-only lock on the mmap. When the mmap is remapped it will
-	// obtain a write lock so all transactions must finish before it can be
-	// remapped.
-	db.mmaplock.RLock()
-
-	// Exit if the database is not open yet.
-	if !db.opened {
-		db.mmaplock.RUnlock()
-		db.metalock.Unlock()
-		return nil, ErrDatabaseNotOpen
-	}
-
-	// Create a transaction associated with the database.
-	t := &Tx{}
-	t.init(db)
-
-	// Keep track of transaction until it closes.
-	db.txs = append(db.txs, t)
-	n := len(db.txs)
-
-	// Unlock the meta pages.
-	db.metalock.Unlock()
-
-	// Update the transaction stats.
-	db.statlock.Lock()
-	db.stats.TxN++
-	db.stats.OpenTxN = n
-	db.statlock.Unlock()
-
-	return t, nil
-}
-
-func (db *DB) beginRWTx() (*Tx, error) {
-	// If the database was opened with Options.ReadOnly, return an error.
-	if db.readOnly {
-		return nil, ErrDatabaseReadOnly
-	}
-
-	// Obtain writer lock. This is released by the transaction when it closes.
-	// This enforces only one writer transaction at a time.
-	db.rwlock.Lock()
-
-	// Once we have the writer lock then we can lock the meta pages so that
-	// we can set up the transaction.
-	db.metalock.Lock()
-	defer db.metalock.Unlock()
-
-	// Exit if the database is not open yet.
-	if !db.opened {
-		db.rwlock.Unlock()
-		return nil, ErrDatabaseNotOpen
-	}
-
-	// Create a transaction associated with the database.
-	t := &Tx{writable: true}
-	t.init(db)
-	db.rwtx = t
-	db.freePages()
-	return t, nil
 }
 
 // freePages releases any pages associated with closed read-only transactions.
@@ -767,113 +855,6 @@ func (db *DB) removeTx(tx *Tx) {
 	db.stats.OpenTxN = n
 	db.stats.TxStats.add(&tx.stats)
 	db.statlock.Unlock()
-}
-
-// Update executes a function within the context of a read-write managed transaction.
-// If no error is returned from the function then the transaction is committed.
-// If an error is returned then the entire transaction is rolled back.
-// Any error that is returned from the function or returned from the commit is
-// returned from the Update() method.
-//
-// Attempting to manually commit or rollback within the function will cause a panic.
-func (db *DB) Update(fn func(*Tx) error) error {
-	t, err := db.Begin(true)
-	if err != nil {
-		return err
-	}
-
-	// Make sure the transaction rolls back in the event of a panic.
-	defer func() {
-		if t.db != nil {
-			t.rollback()
-		}
-	}()
-
-	// Mark as a managed tx so that the inner function cannot manually commit.
-	t.managed = true
-
-	// If an error is returned from the function then rollback and return error.
-	err = fn(t)
-	t.managed = false
-	if err != nil {
-		_ = t.Rollback()
-		return err
-	}
-
-	return t.Commit()
-}
-
-// View executes a function within the context of a managed read-only transaction.
-// Any error that is returned from the function is returned from the View() method.
-//
-// Attempting to manually rollback within the function will cause a panic.
-func (db *DB) View(fn func(*Tx) error) error {
-	t, err := db.Begin(false)
-	if err != nil {
-		return err
-	}
-
-	// Make sure the transaction rolls back in the event of a panic.
-	defer func() {
-		if t.db != nil {
-			t.rollback()
-		}
-	}()
-
-	// Mark as a managed tx so that the inner function cannot manually rollback.
-	t.managed = true
-
-	// If an error is returned from the function then pass it through.
-	err = fn(t)
-	t.managed = false
-	if err != nil {
-		_ = t.Rollback()
-		return err
-	}
-
-	return t.Rollback()
-}
-
-// Batch calls fn as part of a batch. It behaves similar to Update,
-// except:
-//
-// 1. concurrent Batch calls can be combined into a single Bolt
-// transaction.
-//
-// 2. the function passed to Batch may be called multiple times,
-// regardless of whether it returns error or not.
-//
-// This means that Batch function side effects must be idempotent and
-// take permanent effect only after a successful return is seen in
-// caller.
-//
-// The maximum batch size and delay can be adjusted with DB.MaxBatchSize
-// and DB.MaxBatchDelay, respectively.
-//
-// Batch is only useful when there are multiple goroutines calling it.
-func (db *DB) Batch(fn func(*Tx) error) error {
-	errCh := make(chan error, 1)
-
-	db.batchMu.Lock()
-	if (db.batch == nil) || (db.batch != nil && len(db.batch.calls) >= db.MaxBatchSize) {
-		// There is no existing batch, or the existing batch is full; start a new one.
-		db.batch = &batch{
-			db: db,
-		}
-		db.batch.timer = time.AfterFunc(db.MaxBatchDelay, db.batch.trigger)
-	}
-	db.batch.calls = append(db.batch.calls, call{fn: fn, err: errCh})
-	if len(db.batch.calls) >= db.MaxBatchSize {
-		// wake up batch, it's ready to run
-		go db.batch.trigger()
-	}
-	db.batchMu.Unlock()
-
-	err := <-errCh
-	if err == trySolo {
-		err = db.Update(fn)
-	}
-	return err
 }
 
 type call struct {
@@ -962,11 +943,11 @@ func safelyCall(fn func(*Tx) error, tx *Tx) (err error) {
 	return fn(tx)
 }
 
-// Sync executes fdatasync() against the database file handle.
-//
 // This is not necessary under normal operation, however, if you use NoSync
 // then it allows you to force the database file to sync against the disk.
-func (db *DB) Sync() error { return fdatasync(db) }
+func (db *DB) Sync() error { // 刷盘
+	return db.file.Sync()
+}
 
 // Stats retrieves ongoing performance stats for the database.
 // This is only updated when a transaction closes.

@@ -52,12 +52,12 @@ func (tx *Tx) init(db *DB) {
 	// Copy over the root bucket.
 	tx.root = newBucket(tx)
 	tx.root.bucket = &bucket{}
-	*tx.root.bucket = tx.meta.root
+	*tx.root.bucket = tx.meta.root // INFO: 每一个 meta page 初始化时就有一个 root bucket
 
 	// Increment the transaction id and add a page cache for writable transactions.
-	if tx.writable {
+	if tx.writable { // INFO: 开启一个写事务，事务号递增+1
 		tx.pages = make(map[pgid]*page)
-		tx.meta.txid += txid(1)
+		tx.meta.txid += txid(1) // 事务id +1
 	}
 }
 
@@ -146,8 +146,6 @@ func (tx *Tx) Commit() error {
 		return ErrTxNotWritable
 	}
 
-	// TODO(benbjohnson): Use vectorized I/O to write out dirty pages.
-
 	// Rebalance nodes which have had deletions.
 	var startTime = time.Now()
 	tx.root.rebalance()
@@ -180,7 +178,7 @@ func (tx *Tx) Commit() error {
 		tx.meta.freelist = pgidNoFreelist
 	}
 
-	// Write dirty pages to disk.
+	// INFO: Write dirty pages to disk.
 	startTime = time.Now()
 	if err := tx.write(); err != nil {
 		tx.rollback()
@@ -203,7 +201,7 @@ func (tx *Tx) Commit() error {
 		}
 	}
 
-	// Write meta to disk.
+	// INFO: Write meta to disk.
 	if err := tx.writeMeta(); err != nil {
 		tx.rollback()
 		return err
@@ -509,7 +507,7 @@ func (tx *Tx) allocate(count int) (*page, error) {
 	return p, nil
 }
 
-// write writes any dirty pages to disk.
+// INFO: 所有改动在leaf node上，但是B+tree中branch node会分裂操作，称为dirty page脏页，需要把这些脏页刷盘
 func (tx *Tx) write() error {
 	// Sort pages by id.
 	pages := make(pages, 0, len(tx.pages))
@@ -534,6 +532,7 @@ func (tx *Tx) write() error {
 			}
 			buf := unsafeByteSlice(unsafe.Pointer(p), written, 0, int(sz))
 
+			// INFO: 写入 linux page cache 中
 			if _, err := tx.db.ops.writeAt(buf, offset); err != nil {
 				return err
 			}
@@ -553,9 +552,9 @@ func (tx *Tx) write() error {
 		}
 	}
 
-	// Ignore file sync if flag is set on DB.
+	// INFO: etcd 里是定时调用 Commit() 去刷盘，刷盘IO是很费时的
 	if !tx.db.NoSync || IgnoreNoSync {
-		if err := fdatasync(tx.db); err != nil {
+		if err := tx.db.file.Sync(); err != nil { // INFO: 真正的刷盘
 			return err
 		}
 	}
@@ -591,8 +590,9 @@ func (tx *Tx) writeMeta() error {
 	if _, err := tx.db.ops.writeAt(buf, int64(p.id)*int64(tx.db.pageSize)); err != nil {
 		return err
 	}
+	// INFO: etcd 里是定时调用 Commit() 去刷盘，刷盘IO是很费时的
 	if !tx.db.NoSync || IgnoreNoSync {
-		if err := fdatasync(tx.db); err != nil {
+		if err := tx.db.file.Sync(); err != nil { // 刷盘
 			return err
 		}
 	}

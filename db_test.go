@@ -46,7 +46,7 @@ type meta struct {
 func TestOpen(t *testing.T) {
 	path := "./tmp/db"
 	//defer os.RemoveAll(path)
-	
+
 	db, err := bolt.Open(path, 0666, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestOpen(t *testing.T) {
 		t.Fatal("expected db")
 	}
 	defer db.Close()
-	
+
 	if err := db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucket([]byte("widgets"))
 		if err != nil {

@@ -1,10 +1,12 @@
 package bbolt
 
 import (
+	"k8s.io/klog/v2"
 	"reflect"
 	"sort"
 	"testing"
 	"testing/quick"
+	"unsafe"
 )
 
 // Ensure that the page type can be returned in human readable format.
@@ -69,4 +71,8 @@ func TestPgids_merge_quick(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPage(test *testing.T) {
+	klog.Info(unsafe.Sizeof(branchPageElement{})) // branchPageElement 结构体占用 16 字节
 }
