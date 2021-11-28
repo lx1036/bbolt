@@ -156,7 +156,7 @@ func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 
 	// Start from root page/node and traverse to correct page.
 	c.stack = c.stack[:0]
-	c.search(seek, c.bucket.root)
+	c.search(seek, c.bucket.root) // root bucket: {root:3, sequence: 0}
 
 	// If this is a bucket then return a nil value.
 	return c.keyValue()
@@ -267,7 +267,7 @@ func (c *Cursor) search(key []byte, pgid pgid) {
 
 func (c *Cursor) searchNode(key []byte, n *node) {
 	var exact bool
-	index := sort.Search(len(n.inodes), func(i int) bool {
+	index := sort.Search(len(n.inodes), func(i int) bool { // 对于排序的n.inodes，开始二分查找
 		// TODO(benbjohnson): Optimize this range search. It's a bit hacky right now.
 		// sort.Search() finds the lowest index where f() != -1 but we need the highest index.
 		ret := bytes.Compare(n.inodes[i].key, key)
@@ -315,7 +315,7 @@ func (c *Cursor) nsearch(key []byte) {
 
 	// If we have a node then search its inodes.
 	if n != nil {
-		index := sort.Search(len(n.inodes), func(i int) bool {
+		index := sort.Search(len(n.inodes), func(i int) bool { // 对于排序的n.inodes，开始二分查找
 			return bytes.Compare(n.inodes[i].key, key) != -1
 		})
 		e.index = index

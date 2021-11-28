@@ -76,3 +76,15 @@ func TestPgids_merge_quick(t *testing.T) {
 func TestPage(test *testing.T) {
 	klog.Info(unsafe.Sizeof(branchPageElement{})) // branchPageElement 结构体占用 16 字节
 }
+
+func TestName2(test *testing.T) {
+	flags := 11
+	switch flags {
+	case leafPageFlag:
+		klog.Info("adf")
+	}
+
+	if flags&leafPageFlag != 0 {
+		klog.Info("asdfadf", flags&leafPageFlag)
+	}
+}

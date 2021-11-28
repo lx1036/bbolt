@@ -105,7 +105,7 @@ func (tx *Tx) Bucket(name []byte) *Bucket {
 // Returns an error if the bucket already exists, if the bucket name is blank, or if the bucket name is too long.
 // The bucket instance is only valid for the lifetime of the transaction.
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
-	return tx.root.CreateBucket(name)
+	return tx.root.CreateBucket(name) // root bucket: {root:3, sequence: 0}
 }
 
 // CreateBucketIfNotExists creates a new bucket if it doesn't already exist.

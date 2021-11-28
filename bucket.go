@@ -301,6 +301,7 @@ func (b *Bucket) Put(key []byte, value []byte) error {
 
 	// Insert into node.
 	key = cloneBytes(key)
+	// INFO: @see CreateBucket()，这里是 flags=0 不是 bucketLeafFlag，而且都是写在 pageid=0
 	c.node().put(key, key, value, 0, 0)
 
 	return nil
@@ -702,6 +703,7 @@ func (b *Bucket) dereference() {
 
 // pageNode returns the in-memory node, if it exists.
 // Otherwise returns the underlying page.
+// INFO: 先从内存中查找page，即node，没有从磁盘上上找page
 func (b *Bucket) pageNode(id pgid) (*page, *node) {
 	// Inline buckets have a fake page embedded in their value so treat them
 	// differently. We'll return the rootNode (if available) or the fake page.

@@ -295,8 +295,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 			return nil, err
 		}
 	} else {
-		// Read the first meta page to determine the page size.
-		var buf [0x1000]byte
+		var buf [0x1000]byte // 0x1000=2^12=4*1024=4k, len(buf)=4096
 		// If we can't read the page size, but can read a page, assume
 		// it's the same as the OS or one given -- since that's how the
 		// page size was chosen in the first place.

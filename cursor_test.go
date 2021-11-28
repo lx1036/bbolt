@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"k8s.io/klog/v2"
 	"log"
 	"os"
 	"reflect"
@@ -29,6 +30,23 @@ func TestCursor_Bucket(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestName(test *testing.T) {
+	db := MustOpenDB()
+	defer db.MustClose()
+	if err := db.Update(func(tx *bolt.Tx) error {
+		b1, err := tx.CreateBucket([]byte("widgets"))
+		if err != nil {
+			test.Fatal(err)
+		}
+
+		b2 := tx.Bucket([]byte("widgets"))
+		klog.Info(b1.Root(), b2.Root())
+		return nil
+	}); err != nil {
+		test.Fatal(err)
 	}
 }
 
